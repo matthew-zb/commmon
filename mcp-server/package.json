@@ -1,0 +1,16 @@
+{
+  "name": "commmon-mcp-server",
+  "version": "2.0.0",
+  "description": "commmon 데몬에 연결하는 MCP 서버 (COM 포트 시리얼 통신)",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["mcp", "serial", "com-port"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^3.23.0"
+  }
+}

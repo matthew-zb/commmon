@@ -1,0 +1,9 @@
+# Rust
+commmon/target/
+
+# Node.js
+mcp-server/node_modules/
+
+# OS
+Thumbs.db
+.DS_Store
