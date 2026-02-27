@@ -6,12 +6,16 @@ import net from "node:net";
 const DAEMON_HOST = process.env.COMMMON_HOST || "127.0.0.1";
 const DAEMON_PORT = parseInt(process.env.COMMMON_PORT || "9900", 10);
 
+const MAX_RX_STREAM_ENTRIES = 500;
+
 /** TCP 클라이언트로 데몬에 JSON 명령 전송 후 응답 수신 */
 class DaemonClient {
   constructor() {
     this.socket = null;
     this.pending = [];
     this.buffer = "";
+    /** @type {Map<string, Array<{port:string, timestamp:string, ascii:string, hex:string}>>} */
+    this.rxStreamBuffers = new Map();
   }
 
   async connect() {
@@ -35,8 +39,20 @@ class DaemonClient {
 
         try {
           const msg = JSON.parse(line);
-          // notification — 무시 (MCP에서는 불필요)
-          if (msg.notify) continue;
+          // notification 처리
+          if (msg.notify) {
+            if (msg.notify === "rx_data" && msg.data) {
+              const port = msg.data.port;
+              if (port && this.rxStreamBuffers.has(port)) {
+                const buf = this.rxStreamBuffers.get(port);
+                buf.push(msg.data);
+                if (buf.length > MAX_RX_STREAM_ENTRIES) {
+                  buf.splice(0, buf.length - MAX_RX_STREAM_ENTRIES);
+                }
+              }
+            }
+            continue;
+          }
           // 일반 응답
           if (this.pending.length > 0) {
             this.pending.shift()(msg);
@@ -199,6 +215,57 @@ server.tool(
 server.tool("close_monitor", "시리얼 모니터 웹 UI HTTP 서버를 종료합니다", {}, async () => {
   return toMcpResult(await daemon.send("close_monitor"));
 });
+
+server.tool(
+  "subscribe_rx",
+  "COM 포트의 실시간 RX 데이터 구독을 시작합니다. 구독 후 read_rx_stream으로 데이터를 읽을 수 있습니다.",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+  },
+  async ({ port }) => {
+    const resp = await daemon.send("subscribe_rx", { port });
+    if (resp.ok) {
+      daemon.rxStreamBuffers.set(port, []);
+    }
+    return toMcpResult(resp);
+  }
+);
+
+server.tool(
+  "unsubscribe_rx",
+  "COM 포트의 실시간 RX 데이터 구독을 해제합니다",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+  },
+  async ({ port }) => {
+    const resp = await daemon.send("unsubscribe_rx", { port });
+    if (resp.ok) {
+      daemon.rxStreamBuffers.delete(port);
+    }
+    return toMcpResult(resp);
+  }
+);
+
+server.tool(
+  "read_rx_stream",
+  "구독 중인 COM 포트의 실시간 수신 데이터를 읽습니다 (subscribe_rx 후 사용)",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+    clear: z.boolean().default(true).describe("읽은 후 버퍼를 비울지 여부"),
+  },
+  async ({ port, clear }) => {
+    if (!daemon.rxStreamBuffers.has(port)) {
+      return { content: [{ type: "text", text: `${port}는 구독 중이 아닙니다. 먼저 subscribe_rx를 호출하세요.` }], isError: true };
+    }
+    const buf = daemon.rxStreamBuffers.get(port);
+    const data = [...buf];
+    if (clear) {
+      buf.length = 0;
+    }
+    const text = JSON.stringify(data, null, 2);
+    return { content: [{ type: "text", text }] };
+  }
+);
 
 process.on("SIGINT", () => {
   if (daemon.socket) {
