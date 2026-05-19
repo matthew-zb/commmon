@@ -2,9 +2,45 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import net from "node:net";
+import { spawn, exec } from "node:child_process";
+import { promisify } from "node:util";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const DAEMON_HOST = process.env.COMMMON_HOST || "127.0.0.1";
 const DAEMON_PORT = parseInt(process.env.COMMMON_PORT || "9900", 10);
+
+const execAsync = promisify(exec);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DEFAULT_DAEMON_BIN = path.resolve(__dirname, "..", "commmon", "target", "release", "commmon.exe");
+const DAEMON_BIN = process.env.COMMMON_DAEMON_BIN || DEFAULT_DAEMON_BIN;
+
+let daemonChild = null;
+
+async function isDaemonAlive(port = DAEMON_PORT, host = DAEMON_HOST) {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; sock.destroy(); resolve(v); };
+    sock.setTimeout(500);
+    sock.once("connect", () => finish(true));
+    sock.once("timeout", () => finish(false));
+    sock.once("error", () => finish(false));
+    sock.connect(port, host);
+  });
+}
+
+async function findPidByPort(port) {
+  try {
+    const { stdout } = await execAsync(`netstat -ano -p TCP`);
+    const re = new RegExp(`^\\s*TCP\\s+\\S+:${port}\\s+\\S+\\s+LISTENING\\s+(\\d+)`, "m");
+    const m = stdout.match(re);
+    return m ? parseInt(m[1], 10) : null;
+  } catch {
+    return null;
+  }
+}
 
 const MAX_RX_STREAM_ENTRIES = 500;
 
@@ -215,6 +251,113 @@ server.tool(
 server.tool("close_monitor", "시리얼 모니터 웹 UI HTTP 서버를 종료합니다", {}, async () => {
   return toMcpResult(await daemon.send("close_monitor"));
 });
+
+server.tool(
+  "start_daemon",
+  "commmon 백엔드 데몬을 백그라운드로 시작합니다. 이미 실행 중이면 그대로 둡니다.",
+  {
+    port: z.number().default(DAEMON_PORT).describe(`데몬 TCP 포트 (기본값: ${DAEMON_PORT})`),
+    bin: z.string().optional().describe("commmon.exe 경로 (생략 시 mcp-server 옆 ../commmon/target/release/commmon.exe)"),
+  },
+  async ({ port, bin }) => {
+    if (await isDaemonAlive(port)) {
+      const pid = await findPidByPort(port);
+      return { content: [{ type: "text", text: `데몬이 이미 실행 중 (127.0.0.1:${port}${pid ? `, PID ${pid}` : ""})` }] };
+    }
+    const binPath = bin || DAEMON_BIN;
+    try {
+      const child = spawn(binPath, ["daemon", "--port", String(port)], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.on("error", () => {});
+      child.unref();
+      daemonChild = child;
+
+      for (let i = 0; i < 25; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        if (await isDaemonAlive(port)) {
+          return { content: [{ type: "text", text: `데몬 시작 (PID ${child.pid}, 127.0.0.1:${port}, bin: ${binPath})` }] };
+        }
+      }
+      return { content: [{ type: "text", text: `데몬 spawn은 했으나 ${port} 포트가 5초 내에 열리지 않음 (PID ${child.pid}, bin: ${binPath})` }], isError: true };
+    } catch (e) {
+      return { content: [{ type: "text", text: `데몬 시작 실패: ${e.message} (bin: ${binPath})` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "stop_daemon",
+  "실행 중인 commmon 백엔드 데몬을 종료합니다",
+  {
+    port: z.number().default(DAEMON_PORT).describe(`데몬 TCP 포트 (기본값: ${DAEMON_PORT})`),
+  },
+  async ({ port }) => {
+    const alive = await isDaemonAlive(port);
+    if (!alive && !daemonChild) {
+      return { content: [{ type: "text", text: `데몬이 실행 중이 아닙니다 (127.0.0.1:${port})` }] };
+    }
+
+    // 우리 MCP 클라이언트 소켓 정리 (데몬 종료 시 close 이벤트와 함께 자동 정리되지만 명시적으로)
+    if (daemon.socket && !daemon.socket.destroyed) {
+      daemon.socket.destroy();
+    }
+
+    let killedBy = null;
+    if (daemonChild && !daemonChild.killed) {
+      try {
+        await execAsync(`taskkill /F /T /PID ${daemonChild.pid}`);
+        killedBy = `child PID ${daemonChild.pid}`;
+      } catch (e) {
+        try { daemonChild.kill(); killedBy = `child.kill PID ${daemonChild.pid}`; } catch {}
+      }
+      daemonChild = null;
+    }
+
+    if (!killedBy) {
+      const pid = await findPidByPort(port);
+      if (pid) {
+        try {
+          await execAsync(`taskkill /F /T /PID ${pid}`);
+          killedBy = `PID ${pid} (netstat)`;
+        } catch (e) {
+          return { content: [{ type: "text", text: `taskkill 실패: ${e.message}` }], isError: true };
+        }
+      }
+    }
+
+    for (let i = 0; i < 15; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (!(await isDaemonAlive(port))) {
+        return { content: [{ type: "text", text: `데몬 종료 (${killedBy || "이미 종료된 상태"})` }] };
+      }
+    }
+    return { content: [{ type: "text", text: `종료 시도(${killedBy || "대상 미식별"})했으나 ${port} 포트가 여전히 응답 중` }], isError: true };
+  }
+);
+
+server.tool(
+  "daemon_status",
+  "commmon 백엔드 데몬의 실행 상태를 확인합니다",
+  {
+    port: z.number().default(DAEMON_PORT).describe(`데몬 TCP 포트 (기본값: ${DAEMON_PORT})`),
+  },
+  async ({ port }) => {
+    const alive = await isDaemonAlive(port);
+    const pid = alive ? await findPidByPort(port) : null;
+    const text = JSON.stringify({
+      alive,
+      host: DAEMON_HOST,
+      port,
+      pid,
+      childPid: daemonChild?.pid ?? null,
+      bin: DAEMON_BIN,
+    }, null, 2);
+    return { content: [{ type: "text", text }] };
+  }
+);
 
 server.tool(
   "subscribe_rx",
