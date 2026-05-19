@@ -8,3 +8,6 @@ mcp-server/node_modules/
 # OS
 Thumbs.db
 .DS_Store
+
+# Captured serial logs
+*.log
