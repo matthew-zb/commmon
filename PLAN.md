@@ -18,10 +18,11 @@ CLI를 독립적으로 셸에서도 사용 가능하게 하고, MCP 서버는 CL
   └──────────┘        └──────────────┘
 ```
 
-**3개 컴포넌트:**
-1. **commmon daemon** (Rust) — TCP 서버 + 시리얼 포트 관리 + 웹 모니터
+**4개 컴포넌트:**
+1. **commmon daemon** (Rust) — TCP 서버 + 시리얼 포트 관리 + 웹 모니터 + RX 스트리밍
 2. **commmon** (Rust REPL) — TCP 클라이언트, 대화형 인터페이스
 3. **MCP 서버** (Node.js) — TCP 클라이언트, MCP 도구 → JSON 명령 변환
+4. **SDK** (C#, C++, Rust) — 실시간 RX 데이터 수신 경량 클라이언트
 
 ## 설계 결정 사항
 
@@ -62,9 +63,11 @@ CLI를 독립적으로 셸에서도 사용 가능하게 하고, MCP 서버는 CL
 ```
 ← {"notify":"log_stopped","data":{"port":"COM3","reason":"keyword","keyword":"OK","file":"/tmp/log.txt"}}\n
 ← {"notify":"port_error","data":{"port":"COM3","error":"장치 연결 해제"}}\n
+← {"notify":"rx_data","data":{"port":"COM3","timestamp":"2026:02:27 15:23:03","ascii":"Hello","hex":"48656C6C6F"}}\n
 ```
 
-클라이언트는 notification을 무시해도 동작에 영향 없음 (MCP 서버는 무시, REPL은 출력).
+- `log_stopped`, `port_error`: 모든 클라이언트에 broadcast
+- `rx_data`: `subscribe_rx`를 호출한 클라이언트에만 전달 (per-client RX 스트리밍 태스크)
 
 ## 2. Rust CLI (`commmon/`)
 
@@ -113,6 +116,8 @@ commmon> open COM3 115200 8N1          # 포트 열기 (데이터비트/패리�
 commmon> write COM3 hello              # ASCII 전송
 commmon> write COM3 --hex 48454C4C4F   # HEX 전송
 commmon> read COM3                     # 수신 버퍼 읽기
+commmon> subscribe COM3                # 실시간 RX 데이터 구독
+commmon> unsubscribe COM3              # 실시간 RX 구독 해제
 commmon> log start COM3                # 로그 시작 (임시 디렉토리에 자동 생성)
 commmon> log start COM3 --file ./log.txt  # 파일 경로 지정
 commmon> log start COM3 --duration 30  # 30초 후 자동 중지
@@ -138,7 +143,7 @@ commmon/
   Cargo.toml
   src/
     main.rs          — 엔트리포인트, clap 서브커맨드 분기
-    daemon.rs        — TCP 서버 + 명령 디스패치
+    daemon.rs        — TCP 서버 + 명령 디스패치 + RX 스트리밍 태스크
     serial.rs        — 시리얼 포트 관리 (open/close/write/read/log)
     repl.rs          — REPL 모드 (TCP 클라이언트 + rustyline)
     protocol.rs      — 요청/응답 JSON 타입 정의
@@ -146,44 +151,63 @@ commmon/
     monitor.html     — 웹 UI HTML (include_str!)
 ```
 
-## 3. Node.js MCP 서버 (`com-port-mcp-server/`)
+## 3. Node.js MCP 서버 (`mcp-server/`)
 
-기존 `com-port-mcp-server/index.js`를 수정:
 - 직접 serialport를 사용하는 대신 commmon 데몬에 TCP 연결
 - 각 MCP 도구 호출 시 JSON 명령을 데몬에 전송하고 응답을 MCP 결과로 변환
-- `serialport` 의존성 제거, TCP 클라이언트만 사용 (net 모듈)
+- `serialport` 의존성 없음, TCP 클라이언트만 사용 (net 모듈)
+- `rx_data` notification을 `rxStreamBuffers` Map에 포트별 버퍼링 (max 500)
+- MCP 도구: 기존 11개 + `subscribe_rx`, `unsubscribe_rx`, `read_rx_stream`
 
-또는 기존 파일은 그대로 두고 별도 파일로 만들 수도 있음.
+## 3-1. SDK (`sdk/`)
+
+외부 앱이 데몬 TCP 프로토콜을 직접 사용하여 실시간 RX 데이터를 수신하는 경량 클라이언트.
+
+| SDK | 파일 | 외부 의존성 | 빌드 |
+|---|---|---|---|
+| C# | `sdk/csharp/CommmonRxClient.cs` | 없음 | `dotnet run` |
+| C++ | `sdk/cpp/commmon_rx_client.h/.cpp` | Winsock2 | `cl /EHsc ... ws2_32.lib` |
+| Rust | `sdk/rust/src/lib.rs` | tokio, serde_json | `cargo build` |
+
+핵심 기능: TCP 접속 → `subscribe_rx` → `rx_data` notification 콜백/이벤트 → `unsubscribe_rx`
 
 ## 4. 구현 순서
 
 ### Phase 1: 프로토콜 + 데몬 스켈레톤
-- [ ] Cargo.toml 생성
-- [ ] `protocol.rs` — 요청/응답 타입 정의
-- [ ] `daemon.rs` — TCP 서버 기본 구조 (접속, 명령 파싱, 라우팅)
-- [ ] `main.rs` — clap으로 daemon 서브커맨드
+- [x] Cargo.toml 생성
+- [x] `protocol.rs` — 요청/응답 타입 정의
+- [x] `daemon.rs` — TCP 서버 기본 구조 (접속, 명령 파싱, 라우팅)
+- [x] `main.rs` — clap으로 daemon 서브커맨드
 
 ### Phase 2: 시리얼 핵심 기능
-- [ ] `serial.rs` — list_ports, open_port, close_port, write_port, read_port
-- [ ] 데몬에서 시리얼 명령 연동
+- [x] `serial.rs` — list_ports, open_port, close_port, write_port, read_port
+- [x] 데몬에서 시리얼 명령 연동
 
 ### Phase 3: 로깅
-- [ ] `serial.rs` — start_log, update_log, stop_log
+- [x] `serial.rs` — start_log, update_log, stop_log
 
 ### Phase 4: REPL
-- [ ] `repl.rs` — TCP 클라이언트 + 명령 파싱 + 출력 포맷팅
+- [x] `repl.rs` — TCP 클라이언트 + 명령 파싱 + 출력 포맷팅
 
 ### Phase 5: 모니터
-- [ ] `monitor.rs` + `monitor.html` — HTTP/SSE 서버
-- [ ] open_monitor, close_monitor 명령
+- [x] `monitor.rs` + `monitor.html` — HTTP/SSE 서버
+- [x] open_monitor, close_monitor 명령
 
 ### Phase 6: MCP 서버
-- [ ] Node.js MCP 서버 수정 또는 새로 생성
+- [x] Node.js MCP 서버 수정 또는 새로 생성
 
 ### Phase 7: 마무리
-- [ ] SIGINT 클린업
-- [ ] cargo build --release
-- [ ] 통합 테스트
+- [x] SIGINT 클린업
+- [x] cargo build --release
+- [x] 통합 테스트
+
+### Phase 8: 실시간 RX 구독 + SDK
+- [x] `daemon.rs` — `RxSubCommand` enum, `rx_subscriptions`, RX 스트리밍 태스크, `subscribe_rx`/`unsubscribe_rx` dispatch
+- [x] `repl.rs` — `subscribe`/`unsubscribe` 명령, `rx_data` notification 출력
+- [x] `mcp-server/index.js` — `rxStreamBuffers`, notification handler, `subscribe_rx`/`unsubscribe_rx`/`read_rx_stream` MCP 도구
+- [x] `sdk/csharp/` — C# SDK (`CommmonRxClient.cs`, `Example.cs`)
+- [x] `sdk/cpp/` — C++ SDK (`commmon_rx_client.h/.cpp`, `example.cpp`)
+- [x] `sdk/rust/` — Rust SDK (`lib.rs`, `examples/monitor.rs`)
 
 ## 5. 검증
 
@@ -192,3 +216,8 @@ commmon/
 3. Node.js MCP 서버로 Claude Code에서 동일 기능 동작 확인
 4. 웹 모니터 브라우저에서 확인
 5. 데몬에 REPL과 MCP 동시 접속하여 상태 공유 확인
+6. REPL에서 `subscribe COM14` → 실시간 RX 출력 확인
+7. MCP에서 `subscribe_rx` → `read_rx_stream` 동작 확인
+8. C# 예제 빌드 (`dotnet run`) → 실시간 수신 확인
+9. C++ 예제 빌드 (MSVC) → 실시간 수신 확인
+10. Rust 예제 빌드 (`cargo run --example monitor`) → 수신 확인

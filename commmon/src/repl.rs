@@ -243,6 +243,22 @@ fn parse_command(input: &str) -> Option<String> {
             }
         }
 
+        "subscribe" | "sub" => {
+            if parts.len() < 2 {
+                eprintln!("사용법: subscribe <포트>");
+                return None;
+            }
+            serde_json::json!({"cmd": "subscribe_rx", "args": {"port": parts[1]}})
+        }
+
+        "unsubscribe" | "unsub" => {
+            if parts.len() < 2 {
+                eprintln!("사용법: unsubscribe <포트>");
+                return None;
+            }
+            serde_json::json!({"cmd": "unsubscribe_rx", "args": {"port": parts[1]}})
+        }
+
         "status" => serde_json::json!({"cmd": "port_status"}),
 
         "monitor" => {
@@ -436,6 +452,12 @@ fn print_notification(val: &Value) {
             let err = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
             eprintln!("\n[알림] {} 오류: {}", port, err);
         }
+        "rx_data" => {
+            let port = data.get("port").and_then(|v| v.as_str()).unwrap_or("");
+            let ts = data.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+            let ascii = data.get("ascii").and_then(|v| v.as_str()).unwrap_or("");
+            eprintln!("\n[{}] [{}] {}", ts, port, ascii);
+        }
         _ => {
             eprintln!("\n[알림] {}", serde_json::to_string(val).unwrap_or_default());
         }
@@ -451,6 +473,8 @@ fn print_help() {
   write <포트> <데이터>          ASCII 전송
   write <포트> --hex <HEX>       HEX 전송
   read <포트>                    수신 버퍼 읽기
+  subscribe <포트>               실시간 RX 데이터 구독
+  unsubscribe <포트>             실시간 RX 구독 해제
   log start <포트> [옵션]        로그 시작
     --file <경로>                  파일 경로
     --duration <초>                자동 중지 시간

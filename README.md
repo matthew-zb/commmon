@@ -1,6 +1,6 @@
 # commmon
 
-Windows COM 포트 시리얼 통신 도구. Rust CLI 데몬 + REPL + Node.js MCP 서버.
+Windows COM 포트 시리얼 통신 도구. Rust CLI 데몬 + REPL + Node.js MCP 서버 + SDK.
 
 ## 아키텍처
 
@@ -13,25 +13,32 @@ Windows COM 포트 시리얼 통신 도구. Rust CLI 데몬 + REPL + Node.js MCP
   ┌──────────┐        │              │      └──────────┘
   │ MCP서버  ├───────>│  (TCP서버 +  │
   │ (Node.js)│        │   시리얼관리 │──> monitor.html (HTTP :8765)
-  └──────────┘        └──────────────┘
+  └──────────┘        │              │
+                      └──────┬───────┘
+  ┌──────────┐               │
+  │ SDK      ├───────────────┘
+  │(C#/C++/Rs│   subscribe_rx → rx_data push
+  └──────────┘
 ```
 
 | 컴포넌트 | 언어 | 역할 |
 |---|---|---|
-| **commmon daemon** | Rust | TCP 서버, 시리얼 포트 관리, 로깅, 웹 모니터 |
+| **commmon daemon** | Rust | TCP 서버, 시리얼 포트 관리, 로깅, 웹 모니터, RX 스트리밍 |
 | **commmon** (REPL) | Rust | 대화형 CLI, 데몬에 TCP 접속 |
 | **MCP 서버** | Node.js | Claude Code 등 MCP 클라이언트용 어댑터 |
+| **SDK** | C#, C++, Rust | 실시간 RX 데이터 수신 경량 클라이언트 |
 
-데몬이 시리얼 포트를 관리하고, REPL과 MCP 서버가 동시에 접속하여 동일한 포트 상태를 공유합니다.
+데몬이 시리얼 포트를 관리하고, REPL/MCP 서버/SDK 클라이언트가 동시에 접속하여 동일한 포트 상태를 공유합니다.
 
 ## 기능
 
 - COM 포트 열기/닫기 (baud rate, data bits, parity, stop bits 설정)
 - 데이터 전송 (ASCII, HEX, UTF-8)
 - 수신 데이터 읽기 (클라이언트별 독립 버퍼)
+- **실시간 RX 데이터 구독** (`subscribe_rx` → `rx_data` notification push)
 - 파일 로깅 (시간 제한, 키워드 자동 중지)
 - 웹 모니터 (브라우저에서 실시간 시리얼 데이터 확인)
-- 서버→클라이언트 Notification (로그 완료 알림 등)
+- 서버→클라이언트 Notification (로그 완료 알림, RX 데이터 등)
 
 ## 프로젝트 구조
 
@@ -43,7 +50,7 @@ commmon/
     Cargo.toml
     src/
       main.rs                      엔트리포인트 (clap 서브커맨드)
-      daemon.rs                    TCP 서버 + 클라이언트 세션 관리
+      daemon.rs                    TCP 서버 + 클라이언트 세션 관리 + RX 스트리밍
       serial.rs                    시리얼 포트 관리 + 로깅
       repl.rs                      REPL CLI (rustyline)
       monitor.rs                   웹 모니터 HTTP/SSE 서버 (axum)
@@ -51,7 +58,19 @@ commmon/
       protocol.rs                  TCP 프로토콜 JSON 타입 정의
   mcp-server/                      MCP 서버 (Node.js)
     package.json
-    index.js                       데몬 TCP 클라이언트
+    index.js                       데몬 TCP 클라이언트 + MCP 도구
+  sdk/                             실시간 RX 수신 SDK
+    csharp/
+      CommmonRxClient.cs           C# SDK (단일 파일)
+      Example.cs                   C# 예제
+    cpp/
+      commmon_rx_client.h          C++ 헤더
+      commmon_rx_client.cpp        C++ 구현
+      example.cpp                  C++ 예제
+    rust/
+      Cargo.toml                   Rust SDK 프로젝트
+      src/lib.rs                   Rust SDK
+      examples/monitor.rs          Rust 예제
 ```
 
 ## 설치
@@ -125,6 +144,9 @@ commmon> write COM3 hello                ASCII 전송
 commmon> write COM3 --hex 48454C4C4F     HEX 전송
 commmon> read COM3                       수신 버퍼 읽기
 
+commmon> subscribe COM3                  실시간 RX 데이터 구독
+commmon> unsubscribe COM3                실시간 RX 구독 해제
+
 commmon> log start COM3                  로그 시작 (임시 디렉토리)
 commmon> log start COM3 --file ./log.txt 파일 경로 지정
 commmon> log start COM3 --duration 30    30초 후 자동 중지
@@ -142,6 +164,23 @@ commmon> exit                            종료
 ```
 
 입력 히스토리는 `~/.commmon/history.txt`에 저장되어 다음 세션에서도 사용 가능합니다.
+
+### 실시간 RX 구독
+
+`subscribe`로 포트의 수신 데이터를 실시간으로 REPL에 출력합니다:
+
+```
+commmon> subscribe COM3
+COM3 실시간 RX 구독 시작
+
+[2026:02:27 15:23:03] [COM3] Hello World
+[2026:02:27 15:23:04] [COM3] OK
+
+commmon> unsubscribe COM3
+COM3 실시간 RX 구독 해제
+```
+
+`read`와 달리 폴링 없이 데이터가 도착하면 즉시 출력됩니다.
 
 ## MCP 서버 설치 (Claude Code)
 
@@ -194,6 +233,9 @@ REPL과 MCP 서버를 동시에 사용할 수 있으며, 수신 데이터는 각
 | `close_port` | COM 포트 닫기 |
 | `write_port` | 데이터 전송 |
 | `read_port` | 수신 버퍼 읽기 |
+| `subscribe_rx` | 실시간 RX 데이터 구독 시작 |
+| `unsubscribe_rx` | 실시간 RX 구독 해제 |
+| `read_rx_stream` | 실시간 RX 버퍼 읽기 |
 | `start_log` | 파일 로깅 시작 |
 | `update_log` | 로그 설정 변경 |
 | `stop_log` | 로그 중지 |
@@ -201,18 +243,113 @@ REPL과 MCP 서버를 동시에 사용할 수 있으며, 수신 데이터는 각
 | `open_monitor` | 웹 모니터 시작 |
 | `close_monitor` | 웹 모니터 종료 |
 
+## SDK (실시간 RX 수신)
+
+외부 앱(MFC, .NET, Rust 등)에서 데몬에 TCP 접속하여 실시간 RX 데이터를 수신할 수 있는 경량 SDK를 제공합니다.
+
+### 프로토콜
+
+SDK는 데몬의 TCP 프로토콜을 직접 사용합니다:
+
+```
+→ {"cmd":"subscribe_rx","args":{"port":"COM3"}}\n
+← {"ok":true,"data":"COM3 실시간 RX 구독 시작"}\n
+← {"notify":"rx_data","data":{"port":"COM3","timestamp":"2026:02:27 15:23:03","ascii":"Hello","hex":"48656C6C6F"}}\n
+← {"notify":"rx_data","data":{"port":"COM3","timestamp":"2026:02:27 15:23:04","ascii":"OK","hex":"4F4B"}}\n
+→ {"cmd":"unsubscribe_rx","args":{"port":"COM3"}}\n
+← {"ok":true,"data":"COM3 실시간 RX 구독 해제"}\n
+```
+
+### C# SDK
+
+단일 파일 (`sdk/csharp/CommmonRxClient.cs`), 외부 의존성 없음.
+
+```csharp
+var client = new CommmonRxClient();
+await client.ConnectAsync("127.0.0.1", 9900);
+client.OnData += data => Console.WriteLine($"[{data.Port}] {data.Ascii}");
+await client.SubscribeAsync("COM3");
+// ... 수신 대기 ...
+await client.UnsubscribeAsync("COM3");
+client.Disconnect();
+```
+
+### C++ SDK (MFC/Win32)
+
+헤더+소스 (`sdk/cpp/commmon_rx_client.h/.cpp`), Winsock2만 사용, JSON 라이브러리 불필요.
+
+```cpp
+CommmonRxClient client;
+client.SetCallback([](auto port, auto ts, auto ascii, auto hex) {
+    printf("[%s] %s\n", port, ascii);
+});
+client.Connect("127.0.0.1", 9900);
+client.Subscribe("COM3");
+// ... 수신 대기 ...
+client.Unsubscribe("COM3");
+client.Disconnect();
+```
+
+빌드 (MSVC):
+```bash
+cl /EHsc example.cpp commmon_rx_client.cpp /link ws2_32.lib
+```
+
+### Rust SDK
+
+```bash
+cd sdk/rust
+cargo build
+cargo run --example monitor
+```
+
+```rust
+let mut client = CommmonRxClient::connect("127.0.0.1", 9900).await?;
+let mut rx = client.on_data();
+client.subscribe("COM3").await?;
+while let Ok(data) = rx.recv().await {
+    println!("[{}] {}", data.port, data.ascii);
+}
+```
+
 ## TCP 프로토콜
 
 데몬과 클라이언트 간 newline-delimited JSON 통신:
+
+### 요청-응답
 
 ```
 → {"cmd":"open_port","args":{"port":"COM3","baudRate":115200}}
 ← {"ok":true,"data":"COM3 열기 성공 (115200bps, 8N1)"}
 
 ← {"ok":false,"error":"COM3가 열려 있지 않습니다."}
-
-← {"notify":"log_stopped","data":{"port":"COM3","reason":"keyword","keyword":"OK","file":"..."}}
 ```
+
+### Notification (서버→클라이언트 push)
+
+```
+← {"notify":"log_stopped","data":{"port":"COM3","reason":"keyword","keyword":"OK","file":"..."}}
+← {"notify":"port_error","data":{"port":"COM3","error":"장치 연결 해제"}}
+← {"notify":"rx_data","data":{"port":"COM3","timestamp":"2026:02:27 15:23:03","ascii":"Hello","hex":"48656C6C6F"}}
+```
+
+### 명령 목록
+
+| 명령 | 설명 |
+|---|---|
+| `list_ports` | 포트 목록 조회 |
+| `open_port` | 포트 열기 |
+| `close_port` | 포트 닫기 |
+| `write_port` | 데이터 전송 |
+| `read_port` | 수신 버퍼 읽기 |
+| `subscribe_rx` | 실시간 RX 구독 (rx_data notification push 시작) |
+| `unsubscribe_rx` | 실시간 RX 구독 해제 |
+| `start_log` | 파일 로깅 시작 |
+| `update_log` | 로그 설정 변경 |
+| `stop_log` | 로그 중지 |
+| `port_status` | 전체 상태 조회 |
+| `open_monitor` | 웹 모니터 시작 |
+| `close_monitor` | 웹 모니터 종료 |
 
 ## License
 
