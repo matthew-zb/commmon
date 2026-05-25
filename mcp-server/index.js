@@ -5,6 +5,7 @@ import net from "node:net";
 import { spawn, exec } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
+import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const DAEMON_HOST = process.env.COMMMON_HOST || "127.0.0.1";
@@ -184,13 +185,28 @@ server.tool(
     port: z.string().describe("COM 포트 경로 (예: COM3)"),
     duration: z.number().optional().describe("로그 기록 시간 (초). 생략 시 수동 중지까지 계속"),
     stopKeyword: z.string().optional().describe("이 문자열이 수신 데이터에 포함되면 로그 자동 중지"),
-    filePath: z.string().optional().describe("로그 파일 경로. 생략 시 임시 디렉토리에 자동 생성"),
+    filePath: z.string().optional().describe("로그 파일 경로. 생략 시 현재 작업 디렉토리의 log/ 아래에 자동 생성"),
   },
   async ({ port, duration, stopKeyword, filePath }) => {
     const args = { port };
     if (duration !== undefined) args.duration = duration;
     if (stopKeyword !== undefined) args.stopKeyword = stopKeyword;
-    if (filePath !== undefined) args.filePath = filePath;
+
+    let resolvedPath;
+    if (filePath !== undefined) {
+      resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
+    } else {
+      const ts = new Date().toISOString().replace(/[-:T]/g, "").replace(/\..+$/, "");
+      const safePort = port.replace(/[\\/:*?"<>|]/g, "_");
+      resolvedPath = path.join(process.cwd(), "log", `commmon_${safePort}_${ts}.log`);
+    }
+    try {
+      await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
+    } catch (e) {
+      return toMcpResult({ ok: false, error: `로그 디렉토리 생성 실패: ${e.message}` });
+    }
+    args.filePath = resolvedPath;
+
     return toMcpResult(await daemon.send("start_log", args));
   }
 );
