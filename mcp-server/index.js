@@ -129,6 +129,19 @@ function toMcpResult(resp) {
   return { content: [{ type: "text", text: resp.error || "알 수 없는 오류" }], isError: true };
 }
 
+// 사용자 설명에서 추출한 키워드를 파일명에 안전하게 끼워넣기 위한 정규화.
+// 파일시스템 금지문자/공백을 _로 치환하고 길이를 제한한다. (한글은 유지)
+function sanitizeLabel(label) {
+  if (!label) return "";
+  const cleaned = label
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, "_") // 금지 문자
+    .replace(/\s+/g, "_")           // 공백류 → _
+    .replace(/_+/g, "_")            // 연속 _ 축약
+    .replace(/^_+|_+$/g, "");       // 양끝 _ 제거
+  return cleaned.slice(0, 40);
+}
+
 const server = new McpServer({
   name: "com-port-server",
   version: "2.0.0",
@@ -186,19 +199,29 @@ server.tool(
     duration: z.number().optional().describe("로그 기록 시간 (초). 생략 시 수동 중지까지 계속"),
     stopKeyword: z.string().optional().describe("이 문자열이 수신 데이터에 포함되면 로그 자동 중지"),
     filePath: z.string().optional().describe("로그 파일 경로. 생략 시 현재 작업 디렉토리의 log/ 아래에 자동 생성"),
+    label: z.string().optional().describe("로그의 용도/맥락을 나타내는 키워드(예: 도어락페어링, 부팅테스트). 사용자가 로그 요청과 함께 설명한 내용에서 핵심 키워드를 1~2개 뽑아 전달하면 파일명에 포함됩니다"),
   },
-  async ({ port, duration, stopKeyword, filePath }) => {
+  async ({ port, duration, stopKeyword, filePath, label }) => {
     const args = { port };
     if (duration !== undefined) args.duration = duration;
     if (stopKeyword !== undefined) args.stopKeyword = stopKeyword;
 
+    const safeLabel = sanitizeLabel(label);
+
     let resolvedPath;
     if (filePath !== undefined) {
       resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
+      // 명시적 경로에도 키워드를 확장자 앞에 삽입
+      if (safeLabel) {
+        const ext = path.extname(resolvedPath);
+        const base = resolvedPath.slice(0, resolvedPath.length - ext.length);
+        resolvedPath = `${base}_${safeLabel}${ext}`;
+      }
     } else {
       const ts = new Date().toISOString().replace(/[-:T]/g, "").replace(/\..+$/, "");
       const safePort = port.replace(/[\\/:*?"<>|]/g, "_");
-      resolvedPath = path.join(process.cwd(), "log", `commmon_${safePort}_${ts}.log`);
+      const labelPart = safeLabel ? `${safeLabel}_` : "";
+      resolvedPath = path.join(process.cwd(), "log", `commmon_${safePort}_${labelPart}${ts}.log`);
     }
     try {
       await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
