@@ -21,6 +21,8 @@ enum RxSubCommand {
     AddFilter(String, Vec<String>, broadcast::Receiver<RxEntry>),
     /// 포트의 키워드 필터 해제
     RemoveFilter(String),
+    /// 기존 필터의 키워드 목록만 갱신 (carry 보존, 수신 채널 재사용)
+    SetFilterKeywords(String, Vec<String>),
 }
 
 /// 키워드 필터 상태. 청크 경계에 걸친 키워드를 놓치지 않기 위해
@@ -228,6 +230,12 @@ async fn handle_client(
                     }
                     RxSubCommand::RemoveFilter(port) => {
                         filter_states.remove(&port);
+                    }
+                    RxSubCommand::SetFilterKeywords(port, keywords) => {
+                        // 기존 상태가 있으면 키워드만 교체 (carry 유지)
+                        if let Some(st) = filter_states.get_mut(&port) {
+                            st.keywords = keywords;
+                        }
                     }
                 }
             };
@@ -533,6 +541,81 @@ async fn dispatch(
                 port_name,
                 keywords.join(", ")
             ))
+        }
+
+        "add_filter_rx" => {
+            let port_name = match args.get("port").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::error("port 파라미터가 필요합니다."),
+            };
+
+            // keywords: 문자열 배열 또는 단일 문자열 허용
+            let new_keywords: Vec<String> = match args.get("keywords") {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+                _ => return Response::error("keywords 파라미터(문자열 배열)가 필요합니다."),
+            };
+            if new_keywords.is_empty() {
+                return Response::error("추가할 키워드가 없습니다.");
+            }
+
+            if !serial.is_port_open(&port_name).await {
+                return Response::error(&format!("{}가 열려 있지 않습니다.", port_name));
+            }
+
+            match session.filter_subscriptions.get_mut(&port_name) {
+                // 기존 필터가 있으면 키워드 누적 (중복 제외, carry/hit 보존)
+                Some(existing) => {
+                    for kw in new_keywords {
+                        if !existing.contains(&kw) {
+                            existing.push(kw);
+                        }
+                    }
+                    let merged = existing.clone();
+                    if rx_cmd_tx
+                        .send(RxSubCommand::SetFilterKeywords(port_name.clone(), merged.clone()))
+                        .await
+                        .is_err()
+                    {
+                        return Response::error("스트리밍 태스크 전달 실패");
+                    }
+                    Response::success_msg(&format!(
+                        "{} 키워드 필터 추가 완료. 현재: {}",
+                        port_name,
+                        merged.join(", ")
+                    ))
+                }
+                // 기존 필터가 없으면 신규 등록 (filter_rx와 동일)
+                None => {
+                    let rx = match serial.subscribe(&port_name).await {
+                        Some(rx) => rx,
+                        None => return Response::error(&format!("{} 구독 실패", port_name)),
+                    };
+                    session
+                        .filter_subscriptions
+                        .insert(port_name.clone(), new_keywords.clone());
+                    if rx_cmd_tx
+                        .send(RxSubCommand::AddFilter(
+                            port_name.clone(),
+                            new_keywords.clone(),
+                            rx,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return Response::error("스트리밍 태스크 전달 실패");
+                    }
+                    Response::success_msg(&format!(
+                        "{} 키워드 필터 신규 등록: {}",
+                        port_name,
+                        new_keywords.join(", ")
+                    ))
+                }
+            }
         }
 
         "unfilter_rx" => {

@@ -457,6 +457,26 @@ server.tool(
 );
 
 server.tool(
+  "add_filter_rx",
+  "기존 키워드 필터에 키워드를 추가합니다 (중복 제외). filter_rx와 달리 기존 키워드와 누적된 hit 기록을 유지합니다. 등록된 필터가 없으면 새로 등록합니다.",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+    keywords: z
+      .array(z.string().min(1))
+      .min(1)
+      .describe("추가할 키워드 목록 (예: [\"WARN\", \"타임아웃\"]). 기존 키워드에 합쳐짐"),
+  },
+  async ({ port, keywords }) => {
+    const resp = await daemon.send("add_filter_rx", { port, keywords });
+    if (resp.ok && !daemon.filterHits.has(port)) {
+      // 신규 등록인 경우에만 버퍼 생성, 기존 hit은 보존
+      daemon.filterHits.set(port, []);
+    }
+    return toMcpResult(resp);
+  }
+);
+
+server.tool(
   "unfilter_rx",
   "COM 포트의 키워드 모니터링을 해제합니다",
   {
