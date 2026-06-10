@@ -53,6 +53,8 @@ class DaemonClient {
     this.buffer = "";
     /** @type {Map<string, Array<{port:string, timestamp:string, ascii:string, hex:string}>>} */
     this.rxStreamBuffers = new Map();
+    /** @type {Map<string, Array<{port:string, keyword:string, timestamp:string, context:string}>>} */
+    this.filterHits = new Map();
   }
 
   async connect() {
@@ -82,6 +84,15 @@ class DaemonClient {
               const port = msg.data.port;
               if (port && this.rxStreamBuffers.has(port)) {
                 const buf = this.rxStreamBuffers.get(port);
+                buf.push(msg.data);
+                if (buf.length > MAX_RX_STREAM_ENTRIES) {
+                  buf.splice(0, buf.length - MAX_RX_STREAM_ENTRIES);
+                }
+              }
+            } else if (msg.notify === "filter_hit" && msg.data) {
+              const port = msg.data.port;
+              if (port && this.filterHits.has(port)) {
+                const buf = this.filterHits.get(port);
                 buf.push(msg.data);
                 if (buf.length > MAX_RX_STREAM_ENTRIES) {
                   buf.splice(0, buf.length - MAX_RX_STREAM_ENTRIES);
@@ -417,6 +428,81 @@ server.tool(
       return { content: [{ type: "text", text: `${port}는 구독 중이 아닙니다. 먼저 subscribe_rx를 호출하세요.` }], isError: true };
     }
     const buf = daemon.rxStreamBuffers.get(port);
+    const data = [...buf];
+    if (clear) {
+      buf.length = 0;
+    }
+    const text = JSON.stringify(data, null, 2);
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "filter_rx",
+  "열려 있는 COM 포트의 수신 데이터에서 키워드를 모니터링합니다. 등록한 키워드가 RX 데이터에 나타나면 데몬이 hit을 기록하며, read_filter_hits로 조회합니다. (포트 열림 필요)",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+    keywords: z
+      .array(z.string().min(1))
+      .min(1)
+      .describe("모니터링할 키워드 목록 (예: [\"ERROR\", \"PANIC\", \"부팅완료\"]). 재등록 시 키워드 갱신"),
+  },
+  async ({ port, keywords }) => {
+    const resp = await daemon.send("filter_rx", { port, keywords });
+    if (resp.ok) {
+      daemon.filterHits.set(port, []);
+    }
+    return toMcpResult(resp);
+  }
+);
+
+server.tool(
+  "add_filter_rx",
+  "기존 키워드 필터에 키워드를 추가합니다 (중복 제외). filter_rx와 달리 기존 키워드와 누적된 hit 기록을 유지합니다. 등록된 필터가 없으면 새로 등록합니다.",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+    keywords: z
+      .array(z.string().min(1))
+      .min(1)
+      .describe("추가할 키워드 목록 (예: [\"WARN\", \"타임아웃\"]). 기존 키워드에 합쳐짐"),
+  },
+  async ({ port, keywords }) => {
+    const resp = await daemon.send("add_filter_rx", { port, keywords });
+    if (resp.ok && !daemon.filterHits.has(port)) {
+      // 신규 등록인 경우에만 버퍼 생성, 기존 hit은 보존
+      daemon.filterHits.set(port, []);
+    }
+    return toMcpResult(resp);
+  }
+);
+
+server.tool(
+  "unfilter_rx",
+  "COM 포트의 키워드 모니터링을 해제합니다",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+  },
+  async ({ port }) => {
+    const resp = await daemon.send("unfilter_rx", { port });
+    if (resp.ok) {
+      daemon.filterHits.delete(port);
+    }
+    return toMcpResult(resp);
+  }
+);
+
+server.tool(
+  "read_filter_hits",
+  "모니터링 중인 키워드가 감지된 hit 목록을 읽습니다 (filter_rx 후 사용). 각 hit은 키워드, 타임스탬프, 주변 컨텍스트를 포함합니다",
+  {
+    port: z.string().describe("COM 포트 경로 (예: COM3)"),
+    clear: z.boolean().default(true).describe("읽은 후 버퍼를 비울지 여부"),
+  },
+  async ({ port, clear }) => {
+    if (!daemon.filterHits.has(port)) {
+      return { content: [{ type: "text", text: `${port}에 등록된 필터가 없습니다. 먼저 filter_rx를 호출하세요.` }], isError: true };
+    }
+    const buf = daemon.filterHits.get(port);
     const data = [...buf];
     if (clear) {
       buf.length = 0;

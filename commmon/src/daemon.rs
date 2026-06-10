@@ -17,6 +17,40 @@ const MAX_BUFFER_ENTRIES: usize = 200;
 enum RxSubCommand {
     Subscribe(String, broadcast::Receiver<RxEntry>),
     Unsubscribe(String),
+    /// 포트에 키워드 필터 등록 (포트, 키워드 목록, 수신 채널)
+    AddFilter(String, Vec<String>, broadcast::Receiver<RxEntry>),
+    /// 포트의 키워드 필터 해제
+    RemoveFilter(String),
+    /// 기존 필터의 키워드 목록만 갱신 (carry 보존, 수신 채널 재사용)
+    SetFilterKeywords(String, Vec<String>),
+}
+
+/// 키워드 필터 상태. 청크 경계에 걸친 키워드를 놓치지 않기 위해
+/// 직전 청크의 꼬리(carry)를 다음 매칭 시 앞에 붙여 검사한다.
+struct FilterState {
+    rx: broadcast::Receiver<RxEntry>,
+    keywords: Vec<String>,
+    carry: Vec<u8>,
+}
+
+impl FilterState {
+    /// 경계 매칭에 필요한 최대 carry 길이 = (가장 긴 키워드 바이트 수 - 1)
+    fn max_carry(&self) -> usize {
+        self.keywords
+            .iter()
+            .map(|k| k.len())
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1)
+    }
+}
+
+/// 바이트 슬라이스에서 부분 슬라이스의 첫 위치를 찾는다.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// 데몬 전체 상태
@@ -31,6 +65,8 @@ struct ClientSession {
     buffers: HashMap<String, VecDeque<RxEntry>>,
     /// 실시간 RX push 대상 포트
     rx_subscriptions: HashSet<String>,
+    /// 키워드 필터 등록 포트 → 키워드 목록 (추적/정리용)
+    filter_subscriptions: HashMap<String, Vec<String>>,
 }
 
 impl ClientSession {
@@ -39,6 +75,7 @@ impl ClientSession {
             receivers: HashMap::new(),
             buffers: HashMap::new(),
             rx_subscriptions: HashSet::new(),
+            filter_subscriptions: HashMap::new(),
         }
     }
 
@@ -93,6 +130,7 @@ impl ClientSession {
         self.receivers.remove(port_name);
         self.buffers.remove(port_name);
         self.rx_subscriptions.remove(port_name);
+        self.filter_subscriptions.remove(port_name);
     }
 }
 
@@ -168,28 +206,52 @@ async fn handle_client(
     let writer_rx = Arc::clone(&writer);
     let rx_stream_task = tokio::spawn(async move {
         let mut rx_receivers: HashMap<String, broadcast::Receiver<RxEntry>> = HashMap::new();
+        let mut filter_states: HashMap<String, FilterState> = HashMap::new();
 
-        loop {
-            // 새 명령 수신
-            while let Ok(cmd) = rx_cmd_rx.try_recv() {
-                match cmd {
+        // 명령 적용 헬퍼 (try_recv / 블로킹 recv 양쪽에서 동일하게 사용)
+        macro_rules! apply_cmd {
+            ($cmd:expr) => {
+                match $cmd {
                     RxSubCommand::Subscribe(port, receiver) => {
                         rx_receivers.insert(port, receiver);
                     }
                     RxSubCommand::Unsubscribe(port) => {
                         rx_receivers.remove(&port);
                     }
+                    RxSubCommand::AddFilter(port, keywords, receiver) => {
+                        filter_states.insert(
+                            port,
+                            FilterState {
+                                rx: receiver,
+                                keywords,
+                                carry: Vec::new(),
+                            },
+                        );
+                    }
+                    RxSubCommand::RemoveFilter(port) => {
+                        filter_states.remove(&port);
+                    }
+                    RxSubCommand::SetFilterKeywords(port, keywords) => {
+                        // 기존 상태가 있으면 키워드만 교체 (carry 유지)
+                        if let Some(st) = filter_states.get_mut(&port) {
+                            st.keywords = keywords;
+                        }
+                    }
                 }
+            };
+        }
+
+        loop {
+            // 새 명령 수신
+            while let Ok(cmd) = rx_cmd_rx.try_recv() {
+                apply_cmd!(cmd);
             }
 
-            if rx_receivers.is_empty() {
-                // 구독 없으면 새 명령이 올 때까지 대기
+            if rx_receivers.is_empty() && filter_states.is_empty() {
+                // 구독/필터 없으면 새 명령이 올 때까지 대기
                 match rx_cmd_rx.recv().await {
-                    Some(RxSubCommand::Subscribe(port, receiver)) => {
-                        rx_receivers.insert(port, receiver);
-                    }
-                    Some(RxSubCommand::Unsubscribe(port)) => {
-                        rx_receivers.remove(&port);
+                    Some(cmd) => {
+                        apply_cmd!(cmd);
                         continue;
                     }
                     None => break,
@@ -242,6 +304,75 @@ async fn handle_client(
 
             for port in closed_ports {
                 rx_receivers.remove(&port);
+            }
+
+            // 키워드 필터 폴링
+            let mut filter_closed = Vec::new();
+            for (port_name, st) in filter_states.iter_mut() {
+                let max_carry = st.max_carry();
+                loop {
+                    match st.rx.try_recv() {
+                        Ok(entry) => {
+                            got_data = true;
+                            // carry(직전 꼬리) + 이번 청크를 합쳐 검사
+                            let mut hay = std::mem::take(&mut st.carry);
+                            let carry_len = hay.len();
+                            hay.extend_from_slice(&entry.data);
+
+                            for kw in &st.keywords {
+                                let kw_bytes = kw.as_bytes();
+                                let mut search_from = 0;
+                                while let Some(rel) =
+                                    find_subslice(&hay[search_from..], kw_bytes)
+                                {
+                                    let abs = search_from + rel;
+                                    // 새 데이터를 포함하는 매치만 보고 (carry 내부의 과거 매치 제외)
+                                    if abs + kw_bytes.len() > carry_len {
+                                        let ctx_start = abs.saturating_sub(20);
+                                        let ctx_end = (abs + kw_bytes.len() + 20).min(hay.len());
+                                        let context =
+                                            String::from_utf8_lossy(&hay[ctx_start..ctx_end])
+                                                .to_string();
+                                        let notif = Notification {
+                                            notify: "filter_hit".into(),
+                                            data: serde_json::json!({
+                                                "port": port_name,
+                                                "keyword": kw,
+                                                "timestamp": entry.timestamp,
+                                                "context": context,
+                                            }),
+                                        };
+                                        if let Ok(mut json) = serde_json::to_string(&notif) {
+                                            json.push('\n');
+                                            let mut w = writer_rx.lock().await;
+                                            if w.write_all(json.as_bytes()).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    search_from = abs + 1;
+                                }
+                            }
+
+                            // 다음 매칭을 위해 꼬리 일부를 carry로 보존
+                            let keep = max_carry.min(hay.len());
+                            st.carry = hay[hay.len() - keep..].to_vec();
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            warn!("{} filter 데이터 {}건 누락", port_name, n);
+                            continue;
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            filter_closed.push(port_name.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            for port in filter_closed {
+                filter_states.remove(&port);
             }
 
             if !got_data {
@@ -305,6 +436,11 @@ async fn dispatch(
                             .send(RxSubCommand::Unsubscribe(port_name.to_string()))
                             .await;
                     }
+                    if session.filter_subscriptions.contains_key(port_name) {
+                        let _ = rx_cmd_tx
+                            .send(RxSubCommand::RemoveFilter(port_name.to_string()))
+                            .await;
+                    }
                     session.on_port_closed(port_name);
                 }
             }
@@ -357,6 +493,146 @@ async fn dispatch(
                 .await;
 
             Response::success_msg(&format!("{} 실시간 RX 구독 해제", port_name))
+        }
+
+        "filter_rx" => {
+            let port_name = match args.get("port").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::error("port 파라미터가 필요합니다."),
+            };
+
+            // keywords: 문자열 배열 또는 단일 문자열 허용
+            let keywords: Vec<String> = match args.get("keywords") {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+                _ => return Response::error("keywords 파라미터(문자열 배열)가 필요합니다."),
+            };
+            if keywords.is_empty() {
+                return Response::error("등록할 키워드가 없습니다.");
+            }
+
+            if !serial.is_port_open(&port_name).await {
+                return Response::error(&format!("{}가 열려 있지 않습니다.", port_name));
+            }
+
+            let rx = match serial.subscribe(&port_name).await {
+                Some(rx) => rx,
+                None => return Response::error(&format!("{} 구독 실패", port_name)),
+            };
+
+            // 재등록 시 키워드 갱신 (insert가 덮어씀)
+            session
+                .filter_subscriptions
+                .insert(port_name.clone(), keywords.clone());
+            if rx_cmd_tx
+                .send(RxSubCommand::AddFilter(port_name.clone(), keywords.clone(), rx))
+                .await
+                .is_err()
+            {
+                return Response::error("스트리밍 태스크 전달 실패");
+            }
+
+            Response::success_msg(&format!(
+                "{} 키워드 필터 등록: {}",
+                port_name,
+                keywords.join(", ")
+            ))
+        }
+
+        "add_filter_rx" => {
+            let port_name = match args.get("port").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::error("port 파라미터가 필요합니다."),
+            };
+
+            // keywords: 문자열 배열 또는 단일 문자열 허용
+            let new_keywords: Vec<String> = match args.get("keywords") {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+                _ => return Response::error("keywords 파라미터(문자열 배열)가 필요합니다."),
+            };
+            if new_keywords.is_empty() {
+                return Response::error("추가할 키워드가 없습니다.");
+            }
+
+            if !serial.is_port_open(&port_name).await {
+                return Response::error(&format!("{}가 열려 있지 않습니다.", port_name));
+            }
+
+            match session.filter_subscriptions.get_mut(&port_name) {
+                // 기존 필터가 있으면 키워드 누적 (중복 제외, carry/hit 보존)
+                Some(existing) => {
+                    for kw in new_keywords {
+                        if !existing.contains(&kw) {
+                            existing.push(kw);
+                        }
+                    }
+                    let merged = existing.clone();
+                    if rx_cmd_tx
+                        .send(RxSubCommand::SetFilterKeywords(port_name.clone(), merged.clone()))
+                        .await
+                        .is_err()
+                    {
+                        return Response::error("스트리밍 태스크 전달 실패");
+                    }
+                    Response::success_msg(&format!(
+                        "{} 키워드 필터 추가 완료. 현재: {}",
+                        port_name,
+                        merged.join(", ")
+                    ))
+                }
+                // 기존 필터가 없으면 신규 등록 (filter_rx와 동일)
+                None => {
+                    let rx = match serial.subscribe(&port_name).await {
+                        Some(rx) => rx,
+                        None => return Response::error(&format!("{} 구독 실패", port_name)),
+                    };
+                    session
+                        .filter_subscriptions
+                        .insert(port_name.clone(), new_keywords.clone());
+                    if rx_cmd_tx
+                        .send(RxSubCommand::AddFilter(
+                            port_name.clone(),
+                            new_keywords.clone(),
+                            rx,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return Response::error("스트리밍 태스크 전달 실패");
+                    }
+                    Response::success_msg(&format!(
+                        "{} 키워드 필터 신규 등록: {}",
+                        port_name,
+                        new_keywords.join(", ")
+                    ))
+                }
+            }
+        }
+
+        "unfilter_rx" => {
+            let port_name = match args.get("port").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::error("port 파라미터가 필요합니다."),
+            };
+
+            if session.filter_subscriptions.remove(&port_name).is_none() {
+                return Response::error(&format!("{}에 등록된 필터가 없습니다.", port_name));
+            }
+
+            let _ = rx_cmd_tx
+                .send(RxSubCommand::RemoveFilter(port_name.clone()))
+                .await;
+
+            Response::success_msg(&format!("{} 키워드 필터 해제", port_name))
         }
 
         "write_port" => serial.write_port(args).await,
