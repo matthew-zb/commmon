@@ -236,12 +236,19 @@ REPL과 MCP 서버를 동시에 사용할 수 있으며, 수신 데이터는 각
 | `subscribe_rx` | 실시간 RX 데이터 구독 시작 |
 | `unsubscribe_rx` | 실시간 RX 구독 해제 |
 | `read_rx_stream` | 실시간 RX 버퍼 읽기 |
+| `filter_rx` | 키워드 필터 등록 (감지 시 hit 기록) |
+| `add_filter_rx` | 기존 필터에 키워드 누적 추가 |
+| `unfilter_rx` | 키워드 필터 해제 |
+| `read_filter_hits` | 감지된 키워드 hit 목록 읽기 |
 | `start_log` | 파일 로깅 시작 |
 | `update_log` | 로그 설정 변경 |
 | `stop_log` | 로그 중지 |
 | `port_status` | 전체 상태 조회 |
 | `open_monitor` | 웹 모니터 시작 |
 | `close_monitor` | 웹 모니터 종료 |
+| `start_daemon` | 백엔드 데몬 백그라운드 시작 |
+| `stop_daemon` | 백엔드 데몬 종료 |
+| `daemon_status` | 데몬 실행 상태 확인 |
 
 ## SDK (실시간 RX 수신)
 
@@ -331,6 +338,7 @@ while let Ok(data) = rx.recv().await {
 ← {"notify":"log_stopped","data":{"port":"COM3","reason":"keyword","keyword":"OK","file":"..."}}
 ← {"notify":"port_error","data":{"port":"COM3","error":"장치 연결 해제"}}
 ← {"notify":"rx_data","data":{"port":"COM3","timestamp":"2026:02:27 15:23:03","ascii":"Hello","hex":"48656C6C6F"}}
+← {"notify":"filter_hit","data":{"port":"COM3","keyword":"ERROR","timestamp":"2026:02:27 15:23:03","context":"...주변 텍스트..."}}
 ```
 
 ### 명령 목록
@@ -344,6 +352,9 @@ while let Ok(data) = rx.recv().await {
 | `read_port` | 수신 버퍼 읽기 |
 | `subscribe_rx` | 실시간 RX 구독 (rx_data notification push 시작) |
 | `unsubscribe_rx` | 실시간 RX 구독 해제 |
+| `filter_rx` | 키워드 필터 등록 (filter_hit notification push 시작) |
+| `add_filter_rx` | 기존 필터에 키워드 누적 추가 (중복 제외, carry/hit 보존) |
+| `unfilter_rx` | 키워드 필터 해제 |
 | `start_log` | 파일 로깅 시작 |
 | `update_log` | 로그 설정 변경 |
 | `stop_log` | 로그 중지 |

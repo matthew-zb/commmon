@@ -418,7 +418,7 @@ async fn dispatch(
         "list_ports" => serial.list_ports().await,
 
         "open_port" => {
-            let resp = serial.open_port(args).await;
+            let resp = serial.open_port(args, Arc::clone(serial)).await;
             if resp.ok {
                 if let Some(port_name) = args.get("port").and_then(|v| v.as_str()) {
                     session.ensure_subscribed(port_name, serial).await;
