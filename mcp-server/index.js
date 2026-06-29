@@ -169,8 +169,8 @@ server.tool(
     port: z.string().describe("COM 포트 경로 (예: COM3, COM4)"),
     baudRate: z.number().default(115200).describe("통신 속도 (기본값: 115200)"),
     dataBits: z.enum(["5", "6", "7", "8"]).default("8").describe("데이터 비트"),
-    stopBits: z.enum(["1", "1.5", "2"]).default("1").describe("스톱 비트"),
-    parity: z.enum(["none", "even", "odd", "mark", "space"]).default("none").describe("패리티"),
+    stopBits: z.enum(["1", "2"]).default("1").describe("스톱 비트"),
+    parity: z.enum(["none", "even", "odd"]).default("none").describe("패리티"),
   },
   async ({ port, baudRate, dataBits, stopBits, parity }) => {
     return toMcpResult(await daemon.send("open_port", { port, baudRate, dataBits, stopBits, parity }));

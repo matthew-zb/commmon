@@ -93,7 +93,7 @@ impl SerialManager {
         }
     }
 
-    pub async fn open_port(&self, args: &Value) -> Response {
+    pub async fn open_port(&self, args: &Value, manager: Arc<Self>) -> Response {
         let port_name = match args.get("port").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
             None => return Response::error("port 파라미터가 필요합니다."),
@@ -150,12 +150,14 @@ impl SerialManager {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let tx_clone = tx.clone();
         let port_name_clone = port_name.clone();
+        let notify_tx = self.notify_tx.clone();
 
         let read_task = tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            loop {
+            // 루프가 끝나는 사유를 담는다: EOF(0바이트)=장치 분리, Err=읽기 오류
+            let reason = loop {
                 match reader.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => break "장치 연결 해제".to_string(),
                     Ok(n) => {
                         let entry = RxEntry {
                             timestamp: Local::now().format("%Y:%m:%d %H:%M:%S").to_string(),
@@ -165,10 +167,24 @@ impl SerialManager {
                     }
                     Err(e) => {
                         error!("{} 읽기 오류: {}", port_name_clone, e);
-                        break;
+                        break format!("읽기 오류: {}", e);
                     }
                 }
-            }
+            };
+
+            // 포트가 분리/오류로 끊겼다. 활성 로그를 멈추고 포트 엔트리를 제거한 뒤
+            // 클라이언트에 port_error 알림을 보낸다. 이 정리가 없으면 포트가 ports 맵에
+            // 남아 is_port_open/port_status가 계속 열린 것으로 보고하고, 구독자도 채널
+            // 종료(Closed) 신호를 받지 못한다.
+            manager.stop_log_internal(&port_name_clone).await;
+            manager.ports.lock().await.remove(&port_name_clone);
+            let _ = notify_tx.send(Notification {
+                notify: "port_error".into(),
+                data: serde_json::json!({
+                    "port": port_name_clone,
+                    "error": reason,
+                }),
+            });
         });
 
         let db = match data_bits_str {
